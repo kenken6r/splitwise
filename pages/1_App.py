@@ -17,7 +17,7 @@ qp_page_id = st.query_params.get("page_id", None)
 
 if ("page_id" not in st.session_state or st.session_state["page_id"] is None) and qp_page_id:
     try:
-        st.session_state["page_id"] = int(qp_page_id)
+        st.session_state["page_id"] = str(qp_page_id)  # TEXT id
     except Exception:
         st.session_state["page_id"] = None
 
@@ -27,10 +27,10 @@ if "page_id" not in st.session_state or st.session_state["page_id"] is None:
         st.switch_page("main.py")
     st.stop()
 
-PAGE_ID = int(st.session_state["page_id"])
+PAGE_ID = str(st.session_state["page_id"])
 
 # Keep URL in sync for refresh / revisit
-st.query_params["page_id"] = str(PAGE_ID)
+st.query_params["page_id"] = PAGE_ID
 
 page_row = db.get_page(PAGE_ID)
 page_name = page_row["name"] if page_row else "Unknown"
@@ -399,14 +399,20 @@ with dz2:
                 st.error(msg)
 
 with dz3:
-    st.caption("DB delete is irreversible.")
-    confirm_db = st.checkbox("Confirm delete DB (irreversible)", value=False, key=f"confirm_db_{PAGE_ID}")
-    if st.button("Delete DB (irreversible)", key=f"btn_del_db_{PAGE_ID}"):
-        if not confirm_db:
+    st.caption("Deletes this page and ALL data in it. Other pages are not affected.")
+    confirm_wipe = st.checkbox(
+        "Confirm delete this page (irreversible)",
+        value=False,
+        key=f"confirm_wipe_page_{PAGE_ID}",
+    )
+
+    if st.button("Delete this page and all data", key=f"btn_wipe_page_{PAGE_ID}"):
+        if not confirm_wipe:
             st.error("Please check confirmation first.")
         else:
-            ok, msg = db.delete_db_file()
+            ok, msg = db.wipe_page(PAGE_ID)
             if ok:
+                # Clear session and go back to main
                 st.session_state["page_id"] = None
                 st.session_state["authed_pages"] = set()
                 st.error(msg)

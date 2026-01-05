@@ -36,14 +36,15 @@ if not pages:
 page_label_to_id = {}
 labels = []
 for p in pages:
-    pid = int(p["id"])
+    pid = str(p["id"])  # TEXT id
     has_pw = (p["password_hash"] is not None)
     label = f'{p["name"]}{" (password)" if has_pw else ""}'
     labels.append(label)
     page_label_to_id[label] = pid
 
 selected_label = st.selectbox("Select page", labels)
-selected_id = int(page_label_to_id[selected_label])
+selected_id = str(page_label_to_id[selected_label])  # keep as TEXT
+
 page_row = db.get_page(selected_id)
 has_password = (page_row is not None and page_row["password_hash"] is not None)
 
@@ -61,5 +62,5 @@ if has_password and selected_id not in st.session_state["authed_pages"]:
 else:
     if st.button("Go to app"):
         st.session_state["page_id"] = selected_id
-        st.query_params["page_id"] = str(selected_id)
+        st.query_params["page_id"] = selected_id
         st.switch_page("pages/1_App.py")
