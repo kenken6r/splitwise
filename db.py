@@ -1,16 +1,55 @@
-# db.py (Supabase Postgres version)
+# db.py (Supabase API version using supabase-py)
+# Notes:
+# - Uses Supabase REST API (PostgREST) via supabase-py
+# - No direct Postgres connections (psycopg is not used)
+# - Requires Streamlit secrets:
+#   [supabase]
+#   url = "https://<PROJECT_REF>.supabase.co"
+#   service_role_key = "<SERVICE_ROLE_KEY>"
 
 import hashlib
 import secrets
 from datetime import date
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 import pandas as pd
 import streamlit as st
+from supabase import create_client, Client
 
-import psycopg
-from psycopg.rows import dict_row
-from psycopg import errors as pg_errors
+
+# ------------------------
+# Supabase client
+# ------------------------
+def _supabase_url() -> str:
+    try:
+        return st.secrets["supabase"]["url"]
+    except Exception:
+        raise RuntimeError("Missing secrets: set [supabase].url in .streamlit/secrets.toml or Streamlit Cloud Secrets")
+
+
+def _supabase_service_role_key() -> str:
+    try:
+        return st.secrets["supabase"]["service_role_key"]
+    except Exception:
+        raise RuntimeError(
+            "Missing secrets: set [supabase].service_role_key in .streamlit/secrets.toml or Streamlit Cloud Secrets"
+        )
+
+
+@st.cache_resource(show_spinner=False)
+def _sb() -> Client:
+    return create_client(_supabase_url(), _supabase_service_role_key())
+
+
+def _ok(resp) -> Tuple[bool, Optional[str]]:
+    """
+    supabase-py returns objects with .data and .error in most versions
+    Be defensive across versions.
+    """
+    err = getattr(resp, "error", None)
+    if err:
+        return False, str(err)
+    return True, None
 
 
 # ------------------------
@@ -31,30 +70,19 @@ def _norm_page_id(page_id) -> str:
     return str(page_id).strip()
 
 
-def _db_url() -> str:
-    try:
-        return st.secrets["postgres"]["url"]
-    except Exception:
-        raise RuntimeError("Missing secrets: set [postgres].url in .streamlit/secrets.toml or Streamlit Cloud Secrets")
-
-
-def get_conn() -> psycopg.Connection:
-    # Open a fresh connection each call
-    return psycopg.connect(_db_url(), row_factory=dict_row)
-
-
+# ------------------------
+# Init
+# ------------------------
 def init_db() -> None:
     """
-    You already created tables in Supabase SQL Editor.
-    Keep this as a light connectivity check.
+    Tables are created in Supabase SQL Editor.
+    This only checks that API keys and URL work.
     """
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("select 1 as ok;")
-            _ = cur.fetchone()
-    finally:
-        conn.close()
+    sb = _sb()
+    resp = sb.table("pages").select("id").limit(1).execute()
+    ok, msg = _ok(resp)
+    if not ok:
+        raise RuntimeError(f"Supabase connectivity check failed: {msg}")
 
 
 # ------------------------
@@ -77,29 +105,28 @@ def _make_password_record(password: str) -> Tuple[str, str]:
 
 
 def verify_page_password(page_id, password: str) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
     password = (password or "").strip()
 
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select password_salt, password_hash
-                from pages
-                where id = %s and is_deleted = false
-                """,
-                (page_id,),
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
+    resp = (
+        sb.table("pages")
+        .select("password_salt,password_hash")
+        .eq("id", page_id)
+        .eq("is_deleted", False)
+        .limit(1)
+        .execute()
+    )
+    ok, msg = _ok(resp)
+    if not ok:
+        return False, f"DB error: {msg}"
 
-    if not row:
+    rows = resp.data or []
+    if not rows:
         return False, "Page not found"
 
-    salt = row["password_salt"]
-    pw_hash = row["password_hash"]
+    salt = rows[0].get("password_salt")
+    pw_hash = rows[0].get("password_hash")
 
     if salt is None or pw_hash is None:
         return True, "No password"
@@ -107,310 +134,338 @@ def verify_page_password(page_id, password: str) -> Tuple[bool, str]:
     if not password:
         return False, "Password required"
 
-    ok = _hash_password(password, salt) == pw_hash
-    return (True, "OK") if ok else (False, "Wrong password")
+    ok_pw = _hash_password(password, salt) == pw_hash
+    return (True, "OK") if ok_pw else (False, "Wrong password")
 
 
 # ------------------------
 # Page ops
 # ------------------------
 def create_page(name: str, password: str) -> Tuple[bool, str]:
+    sb = _sb()
     name = (name or "").strip()
     password = (password or "").strip()
     if not name:
         return False, "Page name is empty"
+
+    # fast duplicate name check
+    chk = sb.table("pages").select("id").eq("name", name).eq("is_deleted", False).limit(1).execute()
+    ok, msg = _ok(chk)
+    if not ok:
+        return False, f"DB error: {msg}"
+    if chk.data:
+        return False, "That page name already exists"
 
     salt = None
     pw_hash = None
     if password:
         salt, pw_hash = _make_password_record(password)
 
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            # id collision is extremely unlikely, but retry anyway
-            for _ in range(10):
-                pid = new_page_id()
-                try:
-                    cur.execute(
-                        """
-                        insert into pages (id, name, password_salt, password_hash)
-                        values (%s, %s, %s, %s)
-                        """,
-                        (pid, name, salt, pw_hash),
-                    )
-                    conn.commit()
-                    return True, "Created"
-                except pg_errors.UniqueViolation:
-                    conn.rollback()
-                    # Could be duplicate name or duplicate id
-                    # If name already exists, stop early
-                    cur.execute("select 1 from pages where name = %s limit 1", (name,))
-                    if cur.fetchone():
-                        return False, "That page name already exists"
-                    # Otherwise, treat as id collision and retry
-                    continue
+    # retry id collision
+    for _ in range(10):
+        pid = new_page_id()
+        payload = {
+            "id": pid,
+            "name": name,
+            "password_salt": salt,
+            "password_hash": pw_hash,
+            "is_deleted": False,
+            "deleted_at": None,
+        }
+        resp = sb.table("pages").insert(payload).execute()
+        ok, msg = _ok(resp)
+        if ok:
+            return True, "Created"
 
-            return False, "Failed to create page id. Try again."
-    finally:
-        conn.close()
+        # If name was inserted in parallel by someone else, detect and stop
+        chk2 = sb.table("pages").select("id").eq("name", name).eq("is_deleted", False).limit(1).execute()
+        ok2, _ = _ok(chk2)
+        if ok2 and chk2.data:
+            return False, "That page name already exists"
+
+        # Otherwise assume id collision or transient error and retry a few times
+        continue
+
+    return False, "Failed to create page id. Try again."
 
 
 def list_pages(include_deleted: bool = False) -> List[Dict]:
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            if include_deleted:
-                cur.execute(
-                    """
-                    select id, name, password_hash, is_deleted, deleted_at
-                    from pages
-                    order by lower(name)
-                    """
-                )
-            else:
-                cur.execute(
-                    """
-                    select id, name, password_hash
-                    from pages
-                    where is_deleted = false
-                    order by lower(name)
-                    """
-                )
-            return cur.fetchall()
-    finally:
-        conn.close()
+    sb = _sb()
+    q = sb.table("pages").select("id,name,password_hash,is_deleted,deleted_at")
+    if not include_deleted:
+        q = q.eq("is_deleted", False)
+    resp = q.order("name", desc=False).execute()
+    ok, msg = _ok(resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    return resp.data or []
 
 
 def get_page(page_id) -> Optional[Dict]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select id, name, password_hash
-                from pages
-                where id = %s and is_deleted = false
-                """,
-                (page_id,),
-            )
-            return cur.fetchone()
-    finally:
-        conn.close()
+    resp = (
+        sb.table("pages")
+        .select("id,name,password_hash,password_salt")
+        .eq("id", page_id)
+        .eq("is_deleted", False)
+        .limit(1)
+        .execute()
+    )
+    ok, msg = _ok(resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    rows = resp.data or []
+    return rows[0] if rows else None
 
 
 # ------------------------
 # Member ops (page scoped)
 # ------------------------
 def add_member(page_id, name: str) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
     name = (name or "").strip()
     if not name:
         return False, "Name is empty"
 
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    "insert into members (page_id, name) values (%s, %s)",
-                    (page_id, name),
-                )
-                conn.commit()
-                return True, "Added"
-            except pg_errors.UniqueViolation:
-                conn.rollback()
-                return False, "That name already exists"
-    finally:
-        conn.close()
+    # duplicate check among active members
+    chk = (
+        sb.table("members")
+        .select("id")
+        .eq("page_id", page_id)
+        .eq("name", name)
+        .eq("is_deleted", False)
+        .limit(1)
+        .execute()
+    )
+    ok, msg = _ok(chk)
+    if not ok:
+        return False, f"DB error: {msg}"
+    if chk.data:
+        return False, "That name already exists"
+
+    resp = sb.table("members").insert({"page_id": page_id, "name": name, "is_deleted": False, "deleted_at": None}).execute()
+    ok, msg = _ok(resp)
+    if not ok:
+        return False, f"DB error: {msg}"
+    return True, "Added"
 
 
 def get_members(page_id, include_deleted: bool = False) -> List[Dict]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            if include_deleted:
-                cur.execute(
-                    """
-                    select id, name, is_deleted, deleted_at
-                    from members
-                    where page_id = %s
-                    order by lower(name)
-                    """,
-                    (page_id,),
-                )
-            else:
-                cur.execute(
-                    """
-                    select id, name
-                    from members
-                    where page_id = %s and is_deleted = false
-                    order by lower(name)
-                    """,
-                    (page_id,),
-                )
-            return cur.fetchall()
-    finally:
-        conn.close()
+    q = sb.table("members").select("id,name,is_deleted,deleted_at").eq("page_id", page_id)
+    if not include_deleted:
+        q = q.eq("is_deleted", False)
+    resp = q.order("name", desc=False).execute()
+    ok, msg = _ok(resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    return resp.data or []
 
 
 def member_usage_count(page_id, member_id: int) -> int:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select count(*) as c
-                from expenses
-                where page_id = %s and paid_by_member_id = %s and is_deleted = false
-                """,
-                (page_id, int(member_id)),
-            )
-            c1 = int(cur.fetchone()["c"])
+    member_id = int(member_id)
 
-            cur.execute(
-                """
-                select count(*) as c
-                from expense_shares s
-                join expenses e on e.id = s.expense_id
-                where e.page_id = %s
-                  and s.member_id = %s
-                  and s.is_deleted = false
-                  and e.is_deleted = false
-                """,
-                (page_id, int(member_id)),
-            )
-            c2 = int(cur.fetchone()["c"])
-            return c1 + c2
-    finally:
-        conn.close()
+    r1 = (
+        sb.table("expenses")
+        .select("id", count="exact")
+        .eq("page_id", page_id)
+        .eq("paid_by_member_id", member_id)
+        .eq("is_deleted", False)
+        .execute()
+    )
+    ok, msg = _ok(r1)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    c1 = int(getattr(r1, "count", 0) or 0)
+
+    # shares within page: fetch expense ids for page, then count shares for those expense ids
+    ex_ids_resp = sb.table("expenses").select("id").eq("page_id", page_id).execute()
+    ok, msg = _ok(ex_ids_resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    ex_ids = [int(r["id"]) for r in (ex_ids_resp.data or [])]
+    if not ex_ids:
+        return c1
+
+    r2 = (
+        sb.table("expense_shares")
+        .select("expense_id", count="exact")
+        .in_("expense_id", ex_ids)
+        .eq("member_id", member_id)
+        .eq("is_deleted", False)
+        .execute()
+    )
+    ok, msg = _ok(r2)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    c2 = int(getattr(r2, "count", 0) or 0)
+
+    return c1 + c2
 
 
 def rename_member(page_id, member_id: int, new_name: str) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
+    member_id = int(member_id)
     new_name = (new_name or "").strip()
     if not new_name:
         return False, "Name is empty"
 
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    """
-                    update members
-                    set name = %s
-                    where page_id = %s and id = %s and is_deleted = false
-                    """,
-                    (new_name, page_id, int(member_id)),
-                )
-                if cur.rowcount == 0:
-                    conn.rollback()
-                    return False, "Member not found"
-                conn.commit()
-                return True, "Updated"
-            except pg_errors.UniqueViolation:
-                conn.rollback()
-                return False, "That name already exists"
-    finally:
-        conn.close()
+    # duplicate check
+    chk = (
+        sb.table("members")
+        .select("id")
+        .eq("page_id", page_id)
+        .eq("name", new_name)
+        .eq("is_deleted", False)
+        .limit(1)
+        .execute()
+    )
+    ok, msg = _ok(chk)
+    if not ok:
+        return False, f"DB error: {msg}"
+    if chk.data and int(chk.data[0]["id"]) != member_id:
+        return False, "That name already exists"
+
+    resp = (
+        sb.table("members")
+        .update({"name": new_name})
+        .eq("page_id", page_id)
+        .eq("id", member_id)
+        .eq("is_deleted", False)
+        .execute()
+    )
+    ok, msg = _ok(resp)
+    if not ok:
+        return False, f"DB error: {msg}"
+    if not resp.data:
+        return False, "Member not found"
+    return True, "Updated"
 
 
 def soft_delete_member_everywhere(page_id, member_id: int) -> Tuple[bool, str]:
+    """
+    Not fully transactional via REST API.
+    Best effort updates in a safe order.
+    """
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
+    member_id = int(member_id)
+
     try:
-        with conn.cursor() as cur:
-            # Expenses paid by this member
-            cur.execute(
-                """
-                update expenses
-                set is_deleted = true, deleted_at = now()
-                where page_id = %s and paid_by_member_id = %s and is_deleted = false
-                """,
-                (page_id, int(member_id)),
-            )
+        # 1) Delete expenses paid by this member
+        r1 = (
+            sb.table("expenses")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("page_id", page_id)
+            .eq("paid_by_member_id", member_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(r1)
+        if not ok:
+            return False, f"Delete failed: {msg}"
 
-            # Shares referencing this member inside this page
-            cur.execute(
-                """
-                update expense_shares
-                set is_deleted = true, deleted_at = now()
-                where member_id = %s and is_deleted = false
-                  and expense_id in (select id from expenses where page_id = %s)
-                """,
-                (int(member_id), page_id),
+        # 2) Delete shares referencing this member in this page
+        ex_ids_resp = sb.table("expenses").select("id").eq("page_id", page_id).execute()
+        ok, msg = _ok(ex_ids_resp)
+        if not ok:
+            return False, f"Delete failed: {msg}"
+        ex_ids = [int(r["id"]) for r in (ex_ids_resp.data or [])]
+        if ex_ids:
+            r2 = (
+                sb.table("expense_shares")
+                .update({"is_deleted": True, "deleted_at": "now()"})
+                .in_("expense_id", ex_ids)
+                .eq("member_id", member_id)
+                .eq("is_deleted", False)
+                .execute()
             )
+            ok, msg = _ok(r2)
+            if not ok:
+                return False, f"Delete failed: {msg}"
 
-            # Expenses that now have zero active shares
-            cur.execute(
-                """
-                update expenses
-                set is_deleted = true, deleted_at = now()
-                where page_id = %s and is_deleted = false
-                  and id in (
-                    select e.id
-                    from expenses e
-                    left join expense_shares s
-                      on s.expense_id = e.id and s.is_deleted = false
-                    where e.page_id = %s and e.is_deleted = false
-                    group by e.id
-                    having count(s.member_id) = 0
-                  )
-                """,
-                (page_id, page_id),
-            )
+        # 3) Delete member itself
+        r3 = (
+            sb.table("members")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("page_id", page_id)
+            .eq("id", member_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(r3)
+        if not ok:
+            return False, f"Delete failed: {msg}"
+        if not r3.data:
+            return False, "Member not found"
 
-            # Member itself
-            cur.execute(
-                """
-                update members
-                set is_deleted = true, deleted_at = now()
-                where page_id = %s and id = %s and is_deleted = false
-                """,
-                (page_id, int(member_id)),
-            )
+        # 4) For expenses in page that now have zero active shares, delete the expense
+        active_shares = (
+            sb.table("expense_shares")
+            .select("expense_id")
+            .in_("expense_id", ex_ids)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(active_shares)
+        if not ok:
+            return False, f"Delete failed: {msg}"
+        active_expense_ids = set(int(r["expense_id"]) for r in (active_shares.data or []))
+        for eid in ex_ids:
+            if eid not in active_expense_ids:
+                _ = (
+                    sb.table("expenses")
+                    .update({"is_deleted": True, "deleted_at": "now()"})
+                    .eq("page_id", page_id)
+                    .eq("id", int(eid))
+                    .eq("is_deleted", False)
+                    .execute()
+                )
 
-            conn.commit()
-            return True, "Deleted"
+        return True, "Deleted"
     except Exception as e:
-        conn.rollback()
         return False, f"Delete failed: {e}"
-    finally:
-        conn.close()
 
 
 def restore_member(page_id, member_id: int) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                update members
-                set is_deleted = false, deleted_at = null
-                where page_id = %s and id = %s and is_deleted = true
-                """,
-                (page_id, int(member_id)),
-            )
-            if cur.rowcount == 0:
-                conn.rollback()
-                return False, "Member not found"
-            conn.commit()
-            return True, "Restored"
-    except Exception as e:
-        conn.rollback()
-        return False, f"Restore failed: {e}"
-    finally:
-        conn.close()
+    member_id = int(member_id)
+
+    resp = (
+        sb.table("members")
+        .update({"is_deleted": False, "deleted_at": None})
+        .eq("page_id", page_id)
+        .eq("id", member_id)
+        .eq("is_deleted", True)
+        .execute()
+    )
+    ok, msg = _ok(resp)
+    if not ok:
+        return False, f"Restore failed: {msg}"
+    if not resp.data:
+        return False, "Member not found"
+    return True, "Restored"
 
 
 # ------------------------
 # Expense ops (page scoped)
 # ------------------------
+def _active_member_ids(page_id: str) -> List[int]:
+    sb = _sb()
+    resp = sb.table("members").select("id").eq("page_id", page_id).eq("is_deleted", False).execute()
+    ok, msg = _ok(resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    return [int(r["id"]) for r in (resp.data or [])]
+
+
 def add_expense(
     page_id,
     expense_date: date,
@@ -420,75 +475,66 @@ def add_expense(
     paid_by_member_id: int,
     target_member_ids: List[int],
 ) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
     description = (description or "").strip()
+
     if not description:
         return False, "Title is empty"
-    if amount is None or amount < 0:
+    if amount is None or float(amount) < 0:
         return False, "Invalid amount"
     if currency not in ("USD", "JPY"):
         return False, "Invalid currency"
     if not target_member_ids:
         return False, "Please select targets"
 
-    conn = get_conn()
+    paid_by_member_id = int(paid_by_member_id)
+    target_member_ids = [int(x) for x in target_member_ids]
+
+    # validate payer and targets are active in this page
+    active_ids = set(_active_member_ids(page_id))
+    if paid_by_member_id not in active_ids:
+        return False, "Payer not found"
+    if any(t not in active_ids for t in target_member_ids):
+        return False, "Targets include deleted members"
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select is_deleted from members where page_id = %s and id = %s",
-                (page_id, int(paid_by_member_id)),
+        ex_resp = (
+            sb.table("expenses")
+            .insert(
+                {
+                    "page_id": page_id,
+                    "expense_date": expense_date.isoformat(),
+                    "description": description,
+                    "amount": float(amount),
+                    "currency": currency,
+                    "paid_by_member_id": paid_by_member_id,
+                    "is_deleted": False,
+                    "deleted_at": None,
+                }
             )
-            payer = cur.fetchone()
-            if not payer or bool(payer["is_deleted"]):
-                conn.rollback()
-                return False, "Payer not found"
+            .execute()
+        )
+        ok, msg = _ok(ex_resp)
+        if not ok:
+            return False, f"Save failed: {msg}"
+        if not ex_resp.data:
+            return False, "Save failed"
 
-            cur.execute(
-                """
-                select count(*) as c
-                from members
-                where page_id = %s
-                  and id = any(%s)
-                  and is_deleted = false
-                """,
-                (page_id, [int(x) for x in target_member_ids]),
-            )
-            if int(cur.fetchone()["c"]) != len(target_member_ids):
-                conn.rollback()
-                return False, "Targets include deleted members"
+        expense_id = int(ex_resp.data[0]["id"])
 
-            cur.execute(
-                """
-                insert into expenses (page_id, expense_date, description, amount, currency, paid_by_member_id)
-                values (%s, %s, %s, %s, %s, %s)
-                returning id
-                """,
-                (
-                    page_id,
-                    expense_date,
-                    description,
-                    float(amount),
-                    currency,
-                    int(paid_by_member_id),
-                ),
-            )
-            expense_id = int(cur.fetchone()["id"])
+        share_rows = [
+            {"expense_id": expense_id, "member_id": int(mid), "is_deleted": False, "deleted_at": None}
+            for mid in target_member_ids
+        ]
+        sh_resp = sb.table("expense_shares").insert(share_rows).execute()
+        ok, msg = _ok(sh_resp)
+        if not ok:
+            return False, f"Save failed: {msg}"
 
-            cur.executemany(
-                """
-                insert into expense_shares (expense_id, member_id, is_deleted, deleted_at)
-                values (%s, %s, false, null)
-                """,
-                [(expense_id, int(mid)) for mid in target_member_ids],
-            )
-
-            conn.commit()
-            return True, "Saved"
+        return True, "Saved"
     except Exception as e:
-        conn.rollback()
         return False, f"Save failed: {e}"
-    finally:
-        conn.close()
 
 
 def update_expense(
@@ -501,387 +547,349 @@ def update_expense(
     paid_by_member_id: int,
     target_member_ids: List[int],
 ) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
+    expense_id = int(expense_id)
     description = (description or "").strip()
+
     if not description:
         return False, "Title is empty"
-    if amount is None or amount < 0:
+    if amount is None or float(amount) < 0:
         return False, "Invalid amount"
     if currency not in ("USD", "JPY"):
         return False, "Invalid currency"
     if not target_member_ids:
         return False, "Please select targets"
 
-    conn = get_conn()
+    paid_by_member_id = int(paid_by_member_id)
+    target_member_ids = [int(x) for x in target_member_ids]
+
+    # validate expense exists and is active
+    ex_chk = (
+        sb.table("expenses")
+        .select("id,is_deleted")
+        .eq("page_id", page_id)
+        .eq("id", expense_id)
+        .limit(1)
+        .execute()
+    )
+    ok, msg = _ok(ex_chk)
+    if not ok:
+        return False, f"Update failed: {msg}"
+    if not ex_chk.data or bool(ex_chk.data[0].get("is_deleted", False)):
+        return False, "Expense not found"
+
+    active_ids = set(_active_member_ids(page_id))
+    if paid_by_member_id not in active_ids:
+        return False, "Payer not found"
+    if any(t not in active_ids for t in target_member_ids):
+        return False, "Targets include deleted members"
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select is_deleted from expenses where page_id = %s and id = %s",
-                (page_id, int(expense_id)),
+        up = (
+            sb.table("expenses")
+            .update(
+                {
+                    "expense_date": expense_date.isoformat(),
+                    "description": description,
+                    "amount": float(amount),
+                    "currency": currency,
+                    "paid_by_member_id": paid_by_member_id,
+                }
             )
-            ex = cur.fetchone()
-            if not ex or bool(ex["is_deleted"]):
-                conn.rollback()
-                return False, "Expense not found"
+            .eq("page_id", page_id)
+            .eq("id", expense_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(up)
+        if not ok:
+            return False, f"Update failed: {msg}"
 
-            cur.execute(
-                "select is_deleted from members where page_id = %s and id = %s",
-                (page_id, int(paid_by_member_id)),
-            )
-            payer = cur.fetchone()
-            if not payer or bool(payer["is_deleted"]):
-                conn.rollback()
-                return False, "Payer not found"
+        # soft delete all current shares
+        sd = (
+            sb.table("expense_shares")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("expense_id", expense_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(sd)
+        if not ok:
+            return False, f"Update failed: {msg}"
 
-            cur.execute(
-                """
-                select count(*) as c
-                from members
-                where page_id = %s
-                  and id = any(%s)
-                  and is_deleted = false
-                """,
-                (page_id, [int(x) for x in target_member_ids]),
-            )
-            if int(cur.fetchone()["c"]) != len(target_member_ids):
-                conn.rollback()
-                return False, "Targets include deleted members"
+        # upsert shares back as active
+        upsert_rows = [
+            {"expense_id": expense_id, "member_id": int(mid), "is_deleted": False, "deleted_at": None}
+            for mid in target_member_ids
+        ]
+        us = sb.table("expense_shares").upsert(upsert_rows, on_conflict="expense_id,member_id").execute()
+        ok, msg = _ok(us)
+        if not ok:
+            return False, f"Update failed: {msg}"
 
-            cur.execute(
-                """
-                update expenses
-                set expense_date = %s,
-                    description = %s,
-                    amount = %s,
-                    currency = %s,
-                    paid_by_member_id = %s
-                where page_id = %s and id = %s and is_deleted = false
-                """,
-                (
-                    expense_date,
-                    description,
-                    float(amount),
-                    currency,
-                    int(paid_by_member_id),
-                    page_id,
-                    int(expense_id),
-                ),
-            )
-
-            # Soft delete all current shares
-            cur.execute(
-                """
-                update expense_shares
-                set is_deleted = true, deleted_at = now()
-                where expense_id = %s and is_deleted = false
-                """,
-                (int(expense_id),),
+        # if no active shares remain, delete expense
+        cnt = (
+            sb.table("expense_shares")
+            .select("expense_id", count="exact")
+            .eq("expense_id", expense_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(cnt)
+        if not ok:
+            return False, f"Update failed: {msg}"
+        c = int(getattr(cnt, "count", 0) or 0)
+        if c == 0:
+            _ = (
+                sb.table("expenses")
+                .update({"is_deleted": True, "deleted_at": "now()"})
+                .eq("page_id", page_id)
+                .eq("id", expense_id)
+                .execute()
             )
 
-            # Re add shares with upsert
-            for mid in target_member_ids:
-                cur.execute(
-                    """
-                    insert into expense_shares (expense_id, member_id, is_deleted, deleted_at)
-                    values (%s, %s, false, null)
-                    on conflict (expense_id, member_id)
-                    do update set is_deleted = false, deleted_at = null
-                    """,
-                    (int(expense_id), int(mid)),
-                )
-
-            # If no active share remains, delete expense
-            cur.execute(
-                "select count(*) as c from expense_shares where expense_id = %s and is_deleted = false",
-                (int(expense_id),),
-            )
-            if int(cur.fetchone()["c"]) == 0:
-                cur.execute(
-                    """
-                    update expenses
-                    set is_deleted = true, deleted_at = now()
-                    where page_id = %s and id = %s
-                    """,
-                    (page_id, int(expense_id)),
-                )
-
-            conn.commit()
-            return True, "Updated"
+        return True, "Updated"
     except Exception as e:
-        conn.rollback()
         return False, f"Update failed: {e}"
-    finally:
-        conn.close()
 
 
 def soft_delete_expense(page_id, expense_id: int) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
+    expense_id = int(expense_id)
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                update expenses
-                set is_deleted = true, deleted_at = now()
-                where page_id = %s and id = %s and is_deleted = false
-                """,
-                (page_id, int(expense_id)),
-            )
-            if cur.rowcount == 0:
-                conn.rollback()
-                return False, "Expense not found"
+        r1 = (
+            sb.table("expenses")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("page_id", page_id)
+            .eq("id", expense_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(r1)
+        if not ok:
+            return False, f"Delete failed: {msg}"
+        if not r1.data:
+            return False, "Expense not found"
 
-            cur.execute(
-                """
-                update expense_shares
-                set is_deleted = true, deleted_at = now()
-                where expense_id = %s and is_deleted = false
-                """,
-                (int(expense_id),),
-            )
+        r2 = (
+            sb.table("expense_shares")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("expense_id", expense_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(r2)
+        if not ok:
+            return False, f"Delete failed: {msg}"
 
-            conn.commit()
-            return True, "Deleted"
+        return True, "Deleted"
     except Exception as e:
-        conn.rollback()
         return False, f"Delete failed: {e}"
-    finally:
-        conn.close()
 
 
 def restore_expense(page_id, expense_id: int) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
+    expense_id = int(expense_id)
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select paid_by_member_id
-                from expenses
-                where page_id = %s and id = %s and is_deleted = true
-                """,
-                (page_id, int(expense_id)),
-            )
-            row = cur.fetchone()
-            if not row:
-                conn.rollback()
-                return False, "Expense not found"
+        ex = (
+            sb.table("expenses")
+            .select("paid_by_member_id")
+            .eq("page_id", page_id)
+            .eq("id", expense_id)
+            .eq("is_deleted", True)
+            .limit(1)
+            .execute()
+        )
+        ok, msg = _ok(ex)
+        if not ok:
+            return False, f"Restore failed: {msg}"
+        if not ex.data:
+            return False, "Expense not found"
 
-            payer_id = int(row["paid_by_member_id"])
-            cur.execute(
-                "select is_deleted from members where page_id = %s and id = %s",
-                (page_id, payer_id),
-            )
-            payer = cur.fetchone()
-            if not payer or bool(payer["is_deleted"]):
-                conn.rollback()
-                return False, "Cannot restore: payer is deleted"
+        payer_id = int(ex.data[0]["paid_by_member_id"])
+        payer = (
+            sb.table("members")
+            .select("is_deleted")
+            .eq("page_id", page_id)
+            .eq("id", payer_id)
+            .limit(1)
+            .execute()
+        )
+        ok, msg = _ok(payer)
+        if not ok:
+            return False, f"Restore failed: {msg}"
+        if not payer.data or bool(payer.data[0]["is_deleted"]):
+            return False, "Cannot restore: payer is deleted"
 
-            cur.execute(
-                """
-                update expenses
-                set is_deleted = false, deleted_at = null
-                where page_id = %s and id = %s and is_deleted = true
-                """,
-                (page_id, int(expense_id)),
-            )
+        r1 = (
+            sb.table("expenses")
+            .update({"is_deleted": False, "deleted_at": None})
+            .eq("page_id", page_id)
+            .eq("id", expense_id)
+            .eq("is_deleted", True)
+            .execute()
+        )
+        ok, msg = _ok(r1)
+        if not ok:
+            return False, f"Restore failed: {msg}"
 
-            cur.execute(
-                """
-                update expense_shares
-                set is_deleted = false, deleted_at = null
-                where expense_id = %s
-                  and member_id in (
-                    select id from members
-                    where page_id = %s and is_deleted = false
-                  )
-                """,
-                (int(expense_id), page_id),
+        # restore shares only for active members in this page
+        active_ids = _active_member_ids(page_id)
+        if active_ids:
+            r2 = (
+                sb.table("expense_shares")
+                .update({"is_deleted": False, "deleted_at": None})
+                .eq("expense_id", expense_id)
+                .in_("member_id", active_ids)
+                .execute()
             )
+            ok, msg = _ok(r2)
+            if not ok:
+                return False, f"Restore failed: {msg}"
 
-            cur.execute(
-                "select count(*) as c from expense_shares where expense_id = %s and is_deleted = false",
-                (int(expense_id),),
+        cnt = (
+            sb.table("expense_shares")
+            .select("expense_id", count="exact")
+            .eq("expense_id", expense_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(cnt)
+        if not ok:
+            return False, f"Restore failed: {msg}"
+        c = int(getattr(cnt, "count", 0) or 0)
+        if c == 0:
+            _ = (
+                sb.table("expenses")
+                .update({"is_deleted": True, "deleted_at": "now()"})
+                .eq("page_id", page_id)
+                .eq("id", expense_id)
+                .execute()
             )
-            if int(cur.fetchone()["c"]) == 0:
-                cur.execute(
-                    """
-                    update expenses
-                    set is_deleted = true, deleted_at = now()
-                    where page_id = %s and id = %s
-                    """,
-                    (page_id, int(expense_id)),
-                )
-                conn.commit()
-                return False, "Cannot restore: no active targets"
+            return False, "Cannot restore: no active targets"
 
-            conn.commit()
-            return True, "Restored"
+        return True, "Restored"
     except Exception as e:
-        conn.rollback()
         return False, f"Restore failed: {e}"
-    finally:
-        conn.close()
 
 
 def fetch_expenses(page_id, active_only: bool = True) -> List[Dict]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            if active_only:
-                cur.execute(
-                    """
-                    select
-                        e.id,
-                        e.expense_date,
-                        e.description,
-                        e.amount,
-                        e.currency,
-                        e.paid_by_member_id,
-                        e.created_at,
-                        m.name as paid_by
-                    from expenses e
-                    join members m on m.id = e.paid_by_member_id
-                    where e.page_id = %s
-                      and e.is_deleted = false
-                      and m.is_deleted = false
-                    order by e.expense_date desc, e.created_at desc, e.id desc
-                    """,
-                    (page_id,),
-                )
-            else:
-                cur.execute(
-                    """
-                    select
-                        e.id,
-                        e.expense_date,
-                        e.description,
-                        e.amount,
-                        e.currency,
-                        e.paid_by_member_id,
-                        e.created_at,
-                        e.is_deleted,
-                        e.deleted_at,
-                        m.name as paid_by
-                    from expenses e
-                    join members m on m.id = e.paid_by_member_id
-                    where e.page_id = %s
-                    order by e.expense_date desc, e.created_at desc, e.id desc
-                    """,
-                    (page_id,),
-                )
 
-            expenses = cur.fetchall()
+    # members map
+    mem_resp = sb.table("members").select("id,name,is_deleted").eq("page_id", page_id).execute()
+    ok, msg = _ok(mem_resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+    mem_rows = mem_resp.data or []
+    id_to_name = {int(r["id"]): r["name"] for r in mem_rows}
+    active_member_ids = {int(r["id"]) for r in mem_rows if not bool(r.get("is_deleted", False))}
 
-            for ex in expenses:
-                if active_only:
-                    cur.execute(
-                        """
-                        select m.id, m.name
-                        from expense_shares s
-                        join members m on m.id = s.member_id
-                        where s.expense_id = %s
-                          and s.is_deleted = false
-                          and m.is_deleted = false
-                          and m.page_id = %s
-                        order by lower(m.name)
-                        """,
-                        (int(ex["id"]), page_id),
-                    )
-                    rows = cur.fetchall()
-                    ex["target_ids"] = [int(r["id"]) for r in rows]
-                    ex["targets"] = [r["name"] for r in rows]
-                else:
-                    cur.execute(
-                        """
-                        select m.id, m.name, s.is_deleted
-                        from expense_shares s
-                        join members m on m.id = s.member_id
-                        where s.expense_id = %s
-                          and m.page_id = %s
-                        order by lower(m.name)
-                        """,
-                        (int(ex["id"]), page_id),
-                    )
-                    rows = cur.fetchall()
-                    ex["target_ids"] = [int(r["id"]) for r in rows if not bool(r["is_deleted"])]
-                    ex["targets"] = [r["name"] for r in rows if not bool(r["is_deleted"])]
+    q = sb.table("expenses").select(
+        "id,expense_date,description,amount,currency,paid_by_member_id,created_at,is_deleted,deleted_at"
+    ).eq("page_id", page_id)
 
-            return expenses
-    finally:
-        conn.close()
+    if active_only:
+        q = q.eq("is_deleted", False)
+
+    exp_resp = q.order("expense_date", desc=True).order("created_at", desc=True).order("id", desc=True).execute()
+    ok, msg = _ok(exp_resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+
+    expenses = [dict(r) for r in (exp_resp.data or [])]
+    if not expenses:
+        return []
+
+    # attach paid_by
+    for ex in expenses:
+        ex["paid_by"] = id_to_name.get(int(ex["paid_by_member_id"]), "Unknown")
+
+    expense_ids = [int(r["id"]) for r in expenses]
+
+    # fetch shares for these expenses
+    sh_resp = sb.table("expense_shares").select("expense_id,member_id,is_deleted").in_("expense_id", expense_ids).execute()
+    ok, msg = _ok(sh_resp)
+    if not ok:
+        raise RuntimeError(f"DB error: {msg}")
+
+    shares = sh_resp.data or []
+    shares_by_exp: Dict[int, List[Dict[str, Any]]] = {}
+    for s in shares:
+        eid = int(s["expense_id"])
+        shares_by_exp.setdefault(eid, []).append(s)
+
+    for ex in expenses:
+        eid = int(ex["id"])
+        rows = shares_by_exp.get(eid, [])
+
+        if active_only:
+            active_targets = [
+                int(s["member_id"]) for s in rows if (not bool(s.get("is_deleted", False))) and int(s["member_id"]) in active_member_ids
+            ]
+        else:
+            active_targets = [int(s["member_id"]) for s in rows if not bool(s.get("is_deleted", False))]
+
+        ex["target_ids"] = active_targets
+        ex["targets"] = [id_to_name.get(mid, "Unknown") for mid in active_targets]
+
+    # In active_only mode, hide expenses whose payer is deleted
+    if active_only:
+        filtered = []
+        for ex in expenses:
+            if int(ex["paid_by_member_id"]) in active_member_ids and not bool(ex.get("is_deleted", False)):
+                filtered.append(ex)
+        expenses = filtered
+
+    return expenses
 
 
 def compute_net_balances(page_id) -> Dict[str, Dict[str, float]]:
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "select id, name from members where page_id = %s and is_deleted = false",
-                (page_id,),
-            )
-            members = cur.fetchall()
-            id_to_name = {int(r["id"]): r["name"] for r in members}
+    members = get_members(page_id)
+    id_to_name = {int(r["id"]): r["name"] for r in members}
 
-            balances: Dict[str, Dict[str, float]] = {"USD": {}, "JPY": {}}
-            for name in id_to_name.values():
-                balances["USD"][name] = 0.0
-                balances["JPY"][name] = 0.0
+    balances: Dict[str, Dict[str, float]] = {"USD": {}, "JPY": {}}
+    for name in id_to_name.values():
+        balances["USD"][name] = 0.0
+        balances["JPY"][name] = 0.0
 
-            cur.execute(
-                """
-                select id, amount, currency, paid_by_member_id
-                from expenses
-                where page_id = %s
-                  and is_deleted = false
-                  and paid_by_member_id in (
-                    select id from members where page_id = %s and is_deleted = false
-                  )
-                """,
-                (page_id, page_id),
-            )
-            expenses = cur.fetchall()
+    expenses = fetch_expenses(page_id, active_only=True)
 
-            for ex in expenses:
-                ex_id = int(ex["id"])
-                amount = float(ex["amount"])
-                currency = ex["currency"]
-                payer_id = int(ex["paid_by_member_id"])
+    # build quick active member ids set
+    active_member_ids = set(id_to_name.keys())
 
-                cur.execute(
-                    """
-                    select member_id
-                    from expense_shares
-                    where expense_id = %s
-                      and is_deleted = false
-                      and member_id in (
-                        select id from members where page_id = %s and is_deleted = false
-                      )
-                    """,
-                    (ex_id, page_id),
-                )
-                targets = [int(r["member_id"]) for r in cur.fetchall()]
-                if not targets:
-                    continue
+    for ex in expenses:
+        amount = float(ex["amount"])
+        currency = ex["currency"]
+        payer_id = int(ex["paid_by_member_id"])
+        targets = [int(t) for t in ex.get("target_ids", []) if int(t) in active_member_ids]
 
-                split = amount / len(targets)
+        if not targets:
+            continue
+        if payer_id not in active_member_ids:
+            continue
 
-                payer_name = id_to_name.get(payer_id)
-                if payer_name is None:
-                    continue
-                balances[currency][payer_name] += amount
+        split = amount / len(targets)
 
-                for t in targets:
-                    t_name = id_to_name.get(t)
-                    if t_name is None:
-                        continue
-                    balances[currency][t_name] -= split
+        payer_name = id_to_name.get(payer_id)
+        if payer_name is None:
+            continue
+        balances[currency][payer_name] += amount
 
-            return balances
-    finally:
-        conn.close()
+        for t in targets:
+            t_name = id_to_name.get(t)
+            if t_name is None:
+                continue
+            balances[currency][t_name] -= split
+
+    return balances
 
 
 def build_transaction_matrix(page_id, currency: str) -> pd.DataFrame:
@@ -891,191 +899,182 @@ def build_transaction_matrix(page_id, currency: str) -> pd.DataFrame:
     if not member_names:
         return pd.DataFrame()
 
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select
-                    e.id,
-                    e.expense_date,
-                    e.created_at,
-                    e.description,
-                    e.amount,
-                    m.name as payer_name
-                from expenses e
-                join members m on m.id = e.paid_by_member_id
-                where e.page_id = %s
-                  and e.currency = %s
-                  and e.is_deleted = false
-                  and m.is_deleted = false
-                order by e.expense_date desc, e.created_at desc, e.id desc
-                """,
-                (page_id, currency),
-            )
-            exp_rows = cur.fetchall()
+    expenses = fetch_expenses(page_id, active_only=True)
+    expenses = [e for e in expenses if e["currency"] == currency]
 
-            expense_ids = [int(r["id"]) for r in exp_rows]
-            targets_map: Dict[int, List[str]] = {eid: [] for eid in expense_ids}
+    data_rows: List[Dict[str, Any]] = []
+    for ex in expenses:
+        when_str = str(ex["expense_date"])
+        created_at = str(ex["created_at"])
+        title = ex["description"]
+        amount = float(ex["amount"])
+        payer = ex["paid_by"]
+        targets = ex.get("targets", [])
 
-            if expense_ids:
-                cur.execute(
-                    """
-                    select s.expense_id, m.name as target_name
-                    from expense_shares s
-                    join members m on m.id = s.member_id
-                    where s.expense_id = any(%s)
-                      and s.is_deleted = false
-                      and m.is_deleted = false
-                      and m.page_id = %s
-                    """,
-                    (expense_ids, page_id),
-                )
-                for r in cur.fetchall():
-                    targets_map[int(r["expense_id"])].append(r["target_name"])
+        if not targets:
+            continue
+        split = amount / len(targets)
 
-        data_rows: List[Dict] = []
-        for r in exp_rows:
-            eid = int(r["id"])
-            when_str = str(r["expense_date"])
-            created_at = str(r["created_at"])
-            title = r["description"]
-            amount = float(r["amount"])
-            payer = r["payer_name"]
-            targets = targets_map.get(eid, [])
-            if not targets:
-                continue
+        row: Dict[str, Any] = {"When": when_str, "Created at": created_at, "Title": title}
+        for name in member_names:
+            row[name] = 0.0
 
-            split = amount / len(targets)
-
-            row = {"When": when_str, "Created at": created_at, "Title": title}
-            for name in member_names:
-                row[name] = 0.0
-
+        if payer in row:
             row[payer] += amount
-            for t in targets:
+        for t in targets:
+            if t in row:
                 row[t] -= split
 
-            data_rows.append(row)
+        data_rows.append(row)
 
-        df = pd.DataFrame(data_rows)
-        if df.empty:
-            return df
+    df = pd.DataFrame(data_rows)
+    if df.empty:
+        return df
 
-        cols = ["When", "Created at", "Title"] + member_names
-        return df[cols]
-    finally:
-        conn.close()
+    cols = ["When", "Created at", "Title"] + member_names
+    return df[cols]
 
 
 # ------------------------
 # Bulk and Danger ops (page scoped)
 # ------------------------
 def soft_delete_all_expenses(page_id) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                update expenses
-                set is_deleted = true, deleted_at = now()
-                where page_id = %s and is_deleted = false
-                """,
-                (page_id,),
+        r1 = (
+            sb.table("expenses")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("page_id", page_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(r1)
+        if not ok:
+            return False, f"Bulk delete failed: {msg}"
+
+        ex_ids_resp = sb.table("expenses").select("id").eq("page_id", page_id).execute()
+        ok, msg = _ok(ex_ids_resp)
+        if not ok:
+            return False, f"Bulk delete failed: {msg}"
+        ex_ids = [int(r["id"]) for r in (ex_ids_resp.data or [])]
+        if ex_ids:
+            r2 = (
+                sb.table("expense_shares")
+                .update({"is_deleted": True, "deleted_at": "now()"})
+                .in_("expense_id", ex_ids)
+                .eq("is_deleted", False)
+                .execute()
             )
-            cur.execute(
-                """
-                update expense_shares
-                set is_deleted = true, deleted_at = now()
-                where expense_id in (select id from expenses where page_id = %s)
-                  and is_deleted = false
-                """,
-                (page_id,),
-            )
-        conn.commit()
+            ok, msg = _ok(r2)
+            if not ok:
+                return False, f"Bulk delete failed: {msg}"
+
         return True, "Deleted all history (soft delete)"
     except Exception as e:
-        conn.rollback()
         return False, f"Bulk delete failed: {e}"
-    finally:
-        conn.close()
 
 
 def soft_delete_all_members_everywhere(page_id) -> Tuple[bool, str]:
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                update expenses
-                set is_deleted = true, deleted_at = now()
-                where page_id = %s and is_deleted = false
-                """,
-                (page_id,),
+        # delete expenses
+        r1 = (
+            sb.table("expenses")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("page_id", page_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(r1)
+        if not ok:
+            return False, f"Bulk delete failed: {msg}"
+
+        # delete shares
+        ex_ids_resp = sb.table("expenses").select("id").eq("page_id", page_id).execute()
+        ok, msg = _ok(ex_ids_resp)
+        if not ok:
+            return False, f"Bulk delete failed: {msg}"
+        ex_ids = [int(r["id"]) for r in (ex_ids_resp.data or [])]
+        if ex_ids:
+            r2 = (
+                sb.table("expense_shares")
+                .update({"is_deleted": True, "deleted_at": "now()"})
+                .in_("expense_id", ex_ids)
+                .eq("is_deleted", False)
+                .execute()
             )
-            cur.execute(
-                """
-                update expense_shares
-                set is_deleted = true, deleted_at = now()
-                where expense_id in (select id from expenses where page_id = %s)
-                  and is_deleted = false
-                """,
-                (page_id,),
-            )
-            cur.execute(
-                """
-                update members
-                set is_deleted = true, deleted_at = now()
-                where page_id = %s and is_deleted = false
-                """,
-                (page_id,),
-            )
-        conn.commit()
+            ok, msg = _ok(r2)
+            if not ok:
+                return False, f"Bulk delete failed: {msg}"
+
+        # delete members
+        r3 = (
+            sb.table("members")
+            .update({"is_deleted": True, "deleted_at": "now()"})
+            .eq("page_id", page_id)
+            .eq("is_deleted", False)
+            .execute()
+        )
+        ok, msg = _ok(r3)
+        if not ok:
+            return False, f"Bulk delete failed: {msg}"
+
         return True, "Deleted all members and history (soft delete)"
     except Exception as e:
-        conn.rollback()
         return False, f"Bulk delete failed: {e}"
-    finally:
-        conn.close()
 
 
 def wipe_page(page_id) -> Tuple[bool, str]:
     """
-    Delete ALL data for a single page (members, expenses, shares, and the page itself).
-    This does NOT delete the whole database.
+    Delete ALL data for a single page (shares, expenses, members, page).
+    Not fully transactional via REST API.
     """
+    sb = _sb()
     page_id = _norm_page_id(page_id)
-    conn = get_conn()
+
     try:
-        with conn.cursor() as cur:
-            cur.execute("select id from pages where id = %s and is_deleted = false", (page_id,))
-            if not cur.fetchone():
-                conn.rollback()
-                return False, "Page not found"
+        page = sb.table("pages").select("id").eq("id", page_id).eq("is_deleted", False).limit(1).execute()
+        ok, msg = _ok(page)
+        if not ok:
+            return False, f"Wipe failed: {msg}"
+        if not page.data:
+            return False, "Page not found"
 
-            # shares -> expenses -> members -> page
-            cur.execute(
-                """
-                delete from expense_shares
-                where expense_id in (select id from expenses where page_id = %s)
-                """,
-                (page_id,),
-            )
-            cur.execute("delete from expenses where page_id = %s", (page_id,))
-            cur.execute("delete from members where page_id = %s", (page_id,))
-            cur.execute("delete from pages where id = %s", (page_id,))
+        ex_ids_resp = sb.table("expenses").select("id").eq("page_id", page_id).execute()
+        ok, msg = _ok(ex_ids_resp)
+        if not ok:
+            return False, f"Wipe failed: {msg}"
+        ex_ids = [int(r["id"]) for r in (ex_ids_resp.data or [])]
 
-        conn.commit()
+        if ex_ids:
+            r1 = sb.table("expense_shares").delete().in_("expense_id", ex_ids).execute()
+            ok, msg = _ok(r1)
+            if not ok:
+                return False, f"Wipe failed: {msg}"
+
+        r2 = sb.table("expenses").delete().eq("page_id", page_id).execute()
+        ok, msg = _ok(r2)
+        if not ok:
+            return False, f"Wipe failed: {msg}"
+
+        r3 = sb.table("members").delete().eq("page_id", page_id).execute()
+        ok, msg = _ok(r3)
+        if not ok:
+            return False, f"Wipe failed: {msg}"
+
+        r4 = sb.table("pages").delete().eq("id", page_id).execute()
+        ok, msg = _ok(r4)
+        if not ok:
+            return False, f"Wipe failed: {msg}"
+
         return True, "Deleted this page and all its data"
     except Exception as e:
-        conn.rollback()
         return False, f"Wipe failed: {e}"
-    finally:
-        conn.close()
 
 
 def delete_db_file() -> Tuple[bool, str]:
-    # No local db file in Supabase mode
     return False, "Not supported in Supabase mode"
