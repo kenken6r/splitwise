@@ -10,6 +10,17 @@ import db
 st.set_page_config(page_title="Split App", layout="wide")
 db.init_db()
 
+# ------------------------
+# Restore page_id from URL (so /App?page_id=... works)
+# ------------------------
+qp_page_id = st.query_params.get("page_id", None)
+
+if ("page_id" not in st.session_state or st.session_state["page_id"] is None) and qp_page_id:
+    try:
+        st.session_state["page_id"] = int(qp_page_id)
+    except Exception:
+        st.session_state["page_id"] = None
+
 if "page_id" not in st.session_state or st.session_state["page_id"] is None:
     st.warning("No page selected. Go back to the main page.")
     if st.button("Back to main"):
@@ -17,12 +28,18 @@ if "page_id" not in st.session_state or st.session_state["page_id"] is None:
     st.stop()
 
 PAGE_ID = int(st.session_state["page_id"])
+
+# Keep URL in sync for refresh / revisit
+st.query_params["page_id"] = str(PAGE_ID)
+
 page_row = db.get_page(PAGE_ID)
 page_name = page_row["name"] if page_row else "Unknown"
 
 st.title(f"Split App: {page_name}")
 
-# --- Backup buttons (page-scoped export is only transaction detail; DB file is global) ---
+# ------------------------
+# Backup buttons (page-scoped export is only transaction detail; DB file is global)
+# ------------------------
 c1, c2 = st.columns([1, 1], gap="small")
 
 with c1:
