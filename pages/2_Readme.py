@@ -23,6 +23,13 @@ with tab_en:
 - Data is stored locally by the app.
 - If you delete or restore members, you may need to update existing transactions
   to keep balances consistent.
+- **This page is publicly accessible.**  
+  If you do not want others to see your data, please set a password.
+  - When a password is set, access from the main page requires authentication.
+  - Anyone who knows the direct URL can access the page without a password.
+- **If you want to delete all information after use**, run **Delete page**
+  in the *Danger Zone*.  
+  This action permanently deletes all data and **cannot be undone**.
 
 ### How to use
 1. Create a page (or open an existing one)
@@ -45,6 +52,13 @@ with tab_ja:
 - データはアプリ内に保存されます
 - **メンバーを削除・復元した場合、取引データを更新しないと
   残高が正しく計算されないことがあります**
+- **このページは一般公開されます。**  
+  他の人に見られたくない場合は、必ずパスワードを設定してください。
+  - パスワードを設定すると、メインページからのアクセスには認証が必要になります
+  - URL を直接知っている人は、パスワードなしでアクセスできます
+- **使い終わって情報を消したい場合**は、*Danger Zone* にある
+  **Delete page** を実行してください。  
+  この操作はすべてのデータを完全に削除し、**復元できません**。
 
 ### 使い方
 1. ページを作成する（または既存ページを開く）
