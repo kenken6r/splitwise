@@ -1,4 +1,5 @@
-supabase
-pandas
 streamlit
+pandas
+supabase
+httpx
 openpyxl
