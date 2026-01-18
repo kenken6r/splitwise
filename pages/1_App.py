@@ -19,7 +19,7 @@ pd.options.display.float_format = "{:,.2f}".format
 # ----------------------------------------
 # Streamlit page config + DB init
 # ----------------------------------------
-st.set_page_config(page_title="Split App", layout="wide")
+st.set_page_config(page_title="SplitWiser", layout="wide")
 db.init_db()
 
 # ----------------------------------------

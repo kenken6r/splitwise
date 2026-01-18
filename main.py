@@ -5,7 +5,7 @@ import db
 # --------------------------------------------------
 # App configuration and DB initialization
 # --------------------------------------------------
-st.set_page_config(page_title="Split App", layout="wide")
+st.set_page_config(page_title="SplitWiser", layout="wide")
 db.init_db()
 
 st.title("SplitWiser")
