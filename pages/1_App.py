@@ -626,6 +626,7 @@ with right:
     # Summary
     # ------------------------
     st.subheader("Summary")
+    st.caption("Positive = receive, negative = pay")
 
     members = db.get_members(PAGE_ID)
     if not members:

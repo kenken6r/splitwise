@@ -1277,7 +1277,7 @@ def compute_net_balances(page_id) -> Dict[str, Dict[str, float]]:
 
         out_ccy: Dict[str, float] = {}
         for col in member_cols:
-            out_ccy[str(col)] = float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+            out_ccy[str(col)] = -float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
 
         out[ccy] = out_ccy
 
