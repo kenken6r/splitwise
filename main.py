@@ -36,6 +36,9 @@ st.subheader("Create a page")
 with st.form("create_page_form", clear_on_submit=True):
     name = st.text_input("Page name")
     password = st.text_input("Password (optional)", type="password")
+    st.caption(
+        "This page is public. Set a password if you want to keep your data private. Anyone with the link can access it without a password."
+    )
 
     st.markdown("### Currencies")
 
