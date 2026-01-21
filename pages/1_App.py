@@ -213,50 +213,82 @@ with c2:
     # MAIN
     df_main_share = db.build_transaction_matrix_share(PAGE_ID, MAIN_CCY)
     df_main_net = db.build_transaction_matrix_net(PAGE_ID, MAIN_CCY)
+    df_main_sum = db.build_transaction_matrix_summary(PAGE_ID, MAIN_CCY)  # Member / Net / DR / CR
 
     # SUB (optional)
     df_sub_share = pd.DataFrame()
     df_sub_net = pd.DataFrame()
+    df_sub_sum = pd.DataFrame()
     if HAS_SUB and (SUB_CCY or "").lower() != "none":
         df_sub_share = db.build_transaction_matrix_share(PAGE_ID, SUB_CCY)
         df_sub_net = db.build_transaction_matrix_net(PAGE_ID, SUB_CCY)
+        df_sub_sum = db.build_transaction_matrix_summary(PAGE_ID, SUB_CCY)  # Member / Net / DR / CR
 
     # Build an Excel file in memory
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        # --------------------
+        # MAIN sheets
+        # --------------------
+        main_share_sheet = f"{MAIN_CCY}(share)"[:31]
+        main_net_sheet = f"{MAIN_CCY}(net)"[:31]
+        main_sum_sheet = f"{MAIN_CCY}(DR_CR)"[:31]
+
         # MAIN share
         if df_main_share is None or df_main_share.empty:
             pd.DataFrame({"Info": [f"No {MAIN_CCY} transactions"]}).to_excel(
-                writer, sheet_name=MAIN_CCY, index=False
+                writer, sheet_name=main_share_sheet, index=False
             )
         else:
-            df_main_share.to_excel(writer, sheet_name=MAIN_CCY, index=False)
+            df_main_share.to_excel(writer, sheet_name=main_share_sheet, index=False)
 
         # MAIN net
-        main_net_sheet = f"{MAIN_CCY}(net)"
         if df_main_net is None or df_main_net.empty:
             pd.DataFrame({"Info": [f"No {MAIN_CCY} net rows"]}).to_excel(
-                writer, sheet_name=main_net_sheet[:31], index=False
+                writer, sheet_name=main_net_sheet, index=False
             )
         else:
-            df_main_net.to_excel(writer, sheet_name=main_net_sheet[:31], index=False)
+            df_main_net.to_excel(writer, sheet_name=main_net_sheet, index=False)
 
-        # SUB share + net
+        # MAIN summary (Net / DR / CR)
+        if df_main_sum is None or df_main_sum.empty:
+            pd.DataFrame({"Info": [f"No {MAIN_CCY} summary rows"]}).to_excel(
+                writer, sheet_name=main_sum_sheet, index=False
+            )
+        else:
+            df_main_sum.to_excel(writer, sheet_name=main_sum_sheet, index=False)
+
+        # --------------------
+        # SUB sheets (optional)
+        # --------------------
         if HAS_SUB and (SUB_CCY or "").lower() != "none":
+            sub_share_sheet = f"{SUB_CCY}(share)"[:31]
+            sub_net_sheet = f"{SUB_CCY}(net)"[:31]
+            sub_sum_sheet = f"{SUB_CCY}(DR_CR)"[:31]
+
+            # SUB share
             if df_sub_share is None or df_sub_share.empty:
                 pd.DataFrame({"Info": [f"No {SUB_CCY} transactions"]}).to_excel(
-                    writer, sheet_name=SUB_CCY, index=False
+                    writer, sheet_name=sub_share_sheet, index=False
                 )
             else:
-                df_sub_share.to_excel(writer, sheet_name=SUB_CCY, index=False)
+                df_sub_share.to_excel(writer, sheet_name=sub_share_sheet, index=False)
 
-            sub_net_sheet = f"{SUB_CCY}(net)"
+            # SUB net
             if df_sub_net is None or df_sub_net.empty:
                 pd.DataFrame({"Info": [f"No {SUB_CCY} net rows"]}).to_excel(
-                    writer, sheet_name=sub_net_sheet[:31], index=False
+                    writer, sheet_name=sub_net_sheet, index=False
                 )
             else:
-                df_sub_net.to_excel(writer, sheet_name=sub_net_sheet[:31], index=False)
+                df_sub_net.to_excel(writer, sheet_name=sub_net_sheet, index=False)
+
+            # SUB summary (Net / DR / CR)
+            if df_sub_sum is None or df_sub_sum.empty:
+                pd.DataFrame({"Info": [f"No {SUB_CCY} summary rows"]}).to_excel(
+                    writer, sheet_name=sub_sum_sheet, index=False
+                )
+            else:
+                df_sub_sum.to_excel(writer, sheet_name=sub_sum_sheet, index=False)
 
     # Make the filename filesystem-safe
     safe_page_name = "".join([c for c in (page_name or "") if c not in r'\/:*?"<>|']).strip() or "page"
@@ -632,20 +664,24 @@ with right:
     if not members:
         st.write("No members.")
     else:
-        balances = db.compute_net_balances(PAGE_ID)
+        details = db.compute_balance_details(PAGE_ID)
 
-        # Build tabs from main/sub
         tab_labels = [MAIN_CCY] + ([SUB_CCY] if HAS_SUB else [])
         tabs = st.tabs(tab_labels)
 
-        # Map tabs to balances keys and display
         for idx, ccy in enumerate(tab_labels):
             with tabs[idx]:
-                net_map = balances.get(ccy, {}) if isinstance(balances, dict) else {}
+                m = details.get(ccy, {}) if isinstance(details, dict) else {}
                 rows = []
-                for k, v in (net_map or {}).items():
-                    rows.append({"Member": k, "Net": _fmt_money(float(v or 0.0), ccy)})
+                for member, info in (m or {}).items():
+                    rows.append({
+                        "Member": member,
+                        "Net": _fmt_money(float(info.get("Net", 0.0)), ccy),
+                        "Debt": _fmt_money(float(info.get("Debt", 0.0)), ccy),
+                        "Credit": _fmt_money(float(info.get("Credit", 0.0)), ccy),
+                    })
                 st.dataframe(rows, use_container_width=True, hide_index=True)
+        
 
         # ------------------------
         # Settle up UI
@@ -737,7 +773,7 @@ with right:
             if not ccy:
                 return 0, 0
 
-            dfc = db.build_transaction_matrix(PAGE_ID, ccy)
+            dfc = db.build_transaction_matrix_share(PAGE_ID, ccy)
             if dfc is None or dfc.empty:
                 return 0, 0
 
@@ -1339,7 +1375,7 @@ with right:
             # ------------------------
             # 1) Table view (hide Expense ID)
             # ------------------------
-            df_td = db.build_transaction_matrix(PAGE_ID, ccy)
+            df_td = db.build_transaction_matrix_share(PAGE_ID, ccy)
 
             # Build NG markers by expense id (for picker display)
             ng_by_eid = {}

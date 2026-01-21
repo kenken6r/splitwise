@@ -1243,11 +1243,9 @@ def fetch_expenses(page_id, active_only: bool = True) -> List[Dict]:
 
     return expenses
 
-
-def compute_net_balances(page_id) -> Dict[str, Dict[str, float]]:
+def compute_balance_details(page_id) -> Dict[str, Dict[str, Dict[str, float]]]:
     """
-    Compute net balances by aggregating build_transaction_matrix_net.
-    This guarantees consistency between Summary and Transaction detail (net matrix).
+    Compute Net / Debt / Credit using the SHARE matrix.
     """
     page_id = _norm_page_id(page_id)
 
@@ -1258,38 +1256,59 @@ def compute_net_balances(page_id) -> Dict[str, Dict[str, float]]:
     MAIN = str(main_ccy).upper().strip()
     sub_s = str(sub_raw).strip()
     SUB = str(sub_raw).upper().strip()
-    HAS_SUB = bool(sub_s) and (SUB != "NONE") and (sub_s.lower() != "none")
+    HAS_SUB = bool(sub_s) and SUB != "NONE" and sub_s.lower() != "none"
 
+    # currencies to compute
     ccy_choices = [MAIN] + ([SUB] if HAS_SUB and SUB != MAIN else [])
 
-    out: Dict[str, Dict[str, float]] = {}
+    out: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     for ccy in ccy_choices:
-        df = build_transaction_matrix_net(page_id, ccy)
+        # Share matrix contains:
+        # - Amount
+        # - Paid by
+        # - member columns (share_amount)
+        df = build_transaction_matrix_share(page_id, ccy)
 
         if df is None or df.empty:
             out[ccy] = {}
             continue
 
-        # member columns = all except meta columns
-        meta_cols = {"Expense ID", "Date", "Title", "Note"}
+        # Identify member columns
+        meta_cols = {"Expense ID", "Date", "Title", "Amount", "Paid by", "Note", "NG"}
         member_cols = [c for c in df.columns if c not in meta_cols]
 
-        out_ccy: Dict[str, float] = {}
-        for col in member_cols:
-            out_ccy[str(col)] = -float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+        # --- Debt: sum of consumed amounts (share_amount) ---
+        debt_map: Dict[str, float] = {}
+        for m in member_cols:
+            debt_map[str(m)] = float(
+                pd.to_numeric(df[m], errors="coerce").fillna(0.0).sum()
+            )
+
+        # --- Credit: sum of paid amounts as payer ---
+        credit_map: Dict[str, float] = {str(m): 0.0 for m in member_cols}
+        amount = pd.to_numeric(df["Amount"], errors="coerce").fillna(0.0)
+        payer = df["Paid by"].fillna("")
+
+        for m in member_cols:
+            credit_map[str(m)] = float(amount[payer == m].sum())
+
+        # --- Net = Credit - Debt ---
+        out_ccy: Dict[str, Dict[str, float]] = {}
+        for m in member_cols:
+            name = str(m)
+            credit = credit_map.get(name, 0.0)
+            debt = debt_map.get(name, 0.0)
+
+            out_ccy[name] = {
+                "Net": credit - debt,
+                "Debt": -debt,     # negative: money you owe / consumed
+                "Credit": credit  # positive: money you paid
+            }
 
         out[ccy] = out_ccy
 
     return out
-
-
-def build_transaction_matrix(page_id: str, currency: str) -> pd.DataFrame:
-    """
-    Share matrix (legacy / compatibility):
-    - Member columns show how much each member consumed (share_amount)
-    """
-    return build_transaction_matrix_share(page_id, currency)
 
 
 def build_transaction_matrix_share(page_id: str, currency: str) -> pd.DataFrame:
@@ -1433,9 +1452,9 @@ def build_transaction_matrix_share(page_id: str, currency: str) -> pd.DataFrame:
 
 def build_transaction_matrix_net(page_id: str, currency: str) -> pd.DataFrame:
     """
-    Net matrix:
-    - Member columns show +share_amount for targets
-    - Payer column additionally gets -amount (so each row sums to 0)
+    Net matrix derived from the SHARE matrix:
+      - Member columns start with +share_amount
+      - Payer's column additionally gets -Amount (so each row sums to 0)
     """
     page_id = _norm_page_id(page_id)
 
@@ -1444,123 +1463,71 @@ def build_transaction_matrix_net(page_id: str, currency: str) -> pd.DataFrame:
         return pd.DataFrame()
     currency = currency.upper()
 
-    no_decimal = currency in NO_DECIMAL_CURRENCIES
+    # Build from the share matrix (single source of truth for splits)
+    df_share = build_transaction_matrix_share(page_id, currency)
+    if df_share is None or df_share.empty:
+        return pd.DataFrame()
 
-    members = get_members(page_id) or []
+    # Identify member columns from share matrix
+    meta_cols = {"Expense ID", "Date", "Title", "Amount", "Paid by", "Note", "NG"}
+    member_cols = [c for c in df_share.columns if c not in meta_cols]
 
-    # sort by name (case-insensitive, trimmed) to keep UI consistent
-    members = sorted(
-        [m for m in members if m.get("id") is not None],
-        key=lambda m: str(m.get("name") or "").strip().lower(),
-    )
+    # Prepare output with the net schema
+    cols = ["Expense ID", "Date", "Title"] + member_cols + ["Note"]
+    df_net = df_share.reindex(columns=["Expense ID", "Date", "Title", "Amount", "Paid by"] + member_cols + ["Note"]).copy()
 
-    member_ids = [int(m["id"]) for m in members]
-    member_names = [str(m.get("name") or "") for m in members]
-    id_to_name = {int(m["id"]): str(m.get("name") or "") for m in members}
+    # Ensure numeric types
+    df_net["Amount"] = pd.to_numeric(df_net["Amount"], errors="coerce").fillna(0.0)
+    for m in member_cols:
+        df_net[m] = pd.to_numeric(df_net[m], errors="coerce").fillna(0.0)
 
-    expenses = fetch_expenses(page_id, active_only=True) or []
-    expenses = [e for e in expenses if str(e.get("currency") or "").upper() == currency]
+    # Add payer delta: payer column += -Amount
+    # Note: payer name in "Paid by" must match a member column name
+    for i, payer_name in df_net["Paid by"].fillna("").items():
+        if payer_name in member_cols:
+            df_net.at[i, payer_name] = float(df_net.at[i, payer_name]) - float(df_net.at[i, "Amount"])
 
-    cols = ["Expense ID", "Date", "Title"] + member_names + ["Note"]
-    if not expenses:
-        return pd.DataFrame(columns=cols)
+    # Drop helper columns and reorder
+    df_net = df_net.reindex(columns=cols)
 
-    # ---- fetch shares ----
-    expense_ids = [int(e["id"]) for e in expenses if e.get("id") is not None]
+    # Keep Expense ID as int if possible
+    if "Expense ID" in df_net.columns:
+        df_net["Expense ID"] = pd.to_numeric(df_net["Expense ID"], errors="coerce").fillna(0).astype(int)
 
-    sb = _sb()
-    sh_resp = _execute_with_retry(
-        sb.table("expense_shares")
-        .select("expense_id,member_id,share_amount,is_deleted")
-        .in_("expense_id", expense_ids)
-        .eq("is_deleted", False)
-    )
-    ok, msg = _ok(sh_resp)
-    if not ok:
-        raise RuntimeError(f"DB error: {msg}")
+    return df_net
 
-    shares = sh_resp.data or []
-    shares_by_exp: dict[int, dict[int, float]] = {}
-    for s in shares:
-        eid = int(s["expense_id"])
-        mid = int(s["member_id"])
-        sa = s.get("share_amount")
-        if sa is None:
-            continue
-        shares_by_exp.setdefault(eid, {})[mid] = float(sa)
 
-    def _even_split_map(e: dict) -> dict[int, float]:
-        if (e.get("how") or "even") != "even":
-            return {}
-        amt = float(e.get("amount") or 0.0)
-        targets = [int(x) for x in (e.get("target_ids") or [])]
-        if not targets:
-            return {}
-        each = amt / len(targets)
-        return {mid: float(each) for mid in targets}
+def build_transaction_matrix_summary(page_id: str, currency: str) -> pd.DataFrame:
+    """
+    Summary matrix:
+      - Member : member name
+      - Net    : Credit - Debt (positive = receive, negative = pay)
+      - DR     : Debit  (negative, total consumed)
+      - CR     : Credit (positive, total paid as payer)
+    """
+    page_id = _norm_page_id(page_id)
 
-    def _mmdd(d) -> str:
-        s = str(d or "")
-        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
-            return f"{int(s[5:7])}/{int(s[8:10])}"
-        return s
+    currency = (currency or "").strip()
+    if not currency or currency.lower() == "none":
+        return pd.DataFrame(columns=["Member", "Net", "DR", "CR"])
+    currency = currency.upper()
+
+    # Use balance details as the single source of truth
+    details = compute_balance_details(page_id)
+    m = details.get(currency, {}) if isinstance(details, dict) else {}
 
     rows = []
-    for e in expenses:
-        eid = int(e["id"])
-        amount = float(e.get("amount") or 0.0)
-        payer_id = e.get("paid_by_member_id")
-        payer_id = int(payer_id) if payer_id is not None else None
-        payer_name = id_to_name.get(payer_id) if payer_id is not None else None
+    for member, info in (m or {}).items():
+        rows.append(
+            {
+                "Member": member,
+                "Net": float(info.get("Net", 0.0)),
+                "DR": float(info.get("Debt", 0.0)),    # debit (negative)
+                "CR": float(info.get("Credit", 0.0)),  # credit (positive)
+            }
+        )
 
-        row = {
-            "Expense ID": eid,
-            "Date": _mmdd(e.get("expense_date")),
-            "Title": e.get("description"),
-            "Note": e.get("note") or "",
-        }
-
-        # start all members at 0
-        for name in member_names:
-            row[name] = 0
-
-        # 1) expense_shares
-        share_map = dict(shares_by_exp.get(eid, {}))
-
-        # 2) fallback: fetch_expenses share_amounts
-        if not share_map:
-            sa2 = e.get("share_amounts") or {}
-            share_map = {int(k): float(v) for k, v in sa2.items()}
-
-        # 3) legacy even split
-        if not share_map:
-            share_map = _even_split_map(e)
-
-        # + share for each member
-        for mid, name in zip(member_ids, member_names):
-            v = float(share_map.get(int(mid), 0.0))
-            row[name] = (int(round(v, 0)) if no_decimal else round(v, 2))
-
-        # payer gets -amount (so row sum becomes 0 if shares sum to amount)
-        if payer_name and payer_name in row:
-            payer_delta = -amount
-            if no_decimal:
-                row[payer_name] = int(round(float(row[payer_name]) + payer_delta, 0))
-            else:
-                row[payer_name] = round(float(row[payer_name]) + payer_delta, 2)
-
-        rows.append(row)
-
-    df = pd.DataFrame(rows).reindex(columns=cols)
-
-    # ensure numeric
-    for name in member_names:
-        df[name] = pd.to_numeric(df[name], errors="coerce").fillna(0)
-
-    df["Expense ID"] = pd.to_numeric(df["Expense ID"], errors="coerce").fillna(0).astype(int)
-
-    return df
-
+    return pd.DataFrame(rows)
 
 # ------------------------
 # Bulk and Danger ops (page scoped)
