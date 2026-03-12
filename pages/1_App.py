@@ -664,7 +664,16 @@ with right:
     if not members:
         st.write("No members.")
     else:
-        details = db.compute_balance_details(PAGE_ID)
+        details = db.compute_balance_details(PAGE_ID) or {}
+
+        # Net only map for settlement / convert logic
+        balances = {
+            ccy: {
+                member: float((info or {}).get("Net", 0.0))
+                for member, info in (member_map or {}).items()
+            }
+            for ccy, member_map in details.items()
+        }
 
         tab_labels = [MAIN_CCY] + ([SUB_CCY] if HAS_SUB else [])
         tabs = st.tabs(tab_labels)
